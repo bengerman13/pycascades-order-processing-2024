@@ -1,27 +1,58 @@
 #!/usr/bin/env python3
+"""
+Create CSVs for order fulfullment.
+
+Important context:
+- we changed how we collect shipping information halfway through
+- we also need to ship some things we didn't get information for
+- we are _not_ checking if someone changed their badge info or shirt size
+- we are sending the full batch of things to be shipped to the swag team
+  every time, and they are figuring out what is new and what is old
+"""
 
 import json
 from datetime import datetime
 import csv
+import copy
 
 import pretix as pretix
 
 datestring = datetime.now().isoformat(timespec="minutes")
+# item id for remote badge
 badge_item_id = 462645
+# category id for in-person tickets
 in_person_category_id = 140850
+# question id for shirt size
 tshirt_question_id = 111318
+# item id for in-person shirts
 in_person_swag_item_id = 462644
+# item id for remote swag
 remote_swag_and_stickers_id = 462646
+# question id for badge "extra line" question
 badge_line_question_id = 111704
+# question id for pronouns to be included on badge
 badge_pronouns_question_id = 111703
+# question id for organization/affiliation to include on badge
 badge_affiliation_question_id = 111326
+# item id for remote speaker ticket
 remote_speaker_item_id = 462634
+# question id for remote shipping address
 shipping_address_question_id = 111320
-source_file = 
-shipping_list_file = 
+# get this from Orders > export > Order data (JSON)
+# this contains Orders, Positions, Questions, and Items 
+source_file = "/path/to/pretix.json"
+# get this from Orders > Export > Shipping: List of orders to be shipped
+# this has shipping info for some remote shipped orders
+shipping_list_file = "/path/to/shipping.csv"
+# this is actually about badges, shirts, and speaker gifts
 badge_out_file = f"./badges-{datestring}.csv"
+# this is a summary of how many shirts of each size we need
 shirt_count_file = f"./shirt_count-{datestring}.csv"
+# this correlates shirt sizes to order IDs, and is pretty useless now that shirts are in the badge file
 shirt_details_csv = f"./shirt_details-{datestring}.csv"
+# get this file from orders > export > Invoice Data
+# it's used for best-guess shipping where we didn't collect an address
+invoices_csv = '/path/to/invoices.csv'
 
 def main():
 
@@ -32,6 +63,12 @@ def main():
         reader = csv.DictReader(f)
         for row in reader:
             shipping_rows[row["Order code"]] = row
+
+    invoice_rows = {}
+    with open(invoices_csv) as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            invoice_rows[row["Order code"]] = row
 
     event = pretix.Event.from_dict(d["event"])
     interesting_orders = {}
@@ -44,7 +81,8 @@ def main():
             for position in order.positions:
                 if position.item.id == badge_item_id or position.item.category.id == in_person_category_id:
                     positions_with_badges[order.code] = position
-                    order_dict["badge"] = position
+                    order_dict['badges'] = order_dict.get("badges", [])
+                    order_dict['badges'].append(position)
                 elif position.item.id == remote_swag_and_stickers_id:
                     positions_with_shirts[order.code] = position
                     order_dict["remote shirt"] = position
@@ -62,13 +100,25 @@ def main():
     order_sizes = {}
     size_counts = {}
     for order_code, order in interesting_orders.items():
-        order_data = {"order_code": order_code, "has_remote_shirt": False, "has_badge": False, "has_remote_badge": False, "shipping_street": "", "shipping_city": "", "shipping_state": "", "shipping_zip": "", "shipping_country": ""}
+        order_data = {"order_code": order_code, "has_remote_shirt": False, "has_badge": False, "has_remote_badge": False, "shipping_street": "", "shipping_city": "", "shipping_state": "", "shipping_zip": "", "shipping_country": "", "has_multiple_lines": False}
         order_data["timestamp"] = order["timestamp"]
-        if badge_position := order.get("badge"):
-            if badge_position.item.id == badge_item_id:
-                order_data["has_remote_badge"] = True
-            order_data["has_badge"] = True
-            order_data.update(badge_fields_for_position(badge_position))
+
+
+        if badge_positions := order.get("badges"):
+            if len(badge_positions) > 1:
+                order_data["has_multiple_lines"] = True
+            badge_line = order_data
+            is_first_badge = True
+            for badge_position in badge_positions:
+                if not is_first_badge:
+                    printable_orders.append(badge_line)
+                if badge_position.item.id == badge_item_id:
+                    badge_line["has_remote_badge"] = True
+                badge_line["has_badge"] = True
+                badge_line.update(badge_fields_for_position(badge_position))
+                badge_line = copy.deepcopy(order_data)
+                is_first_badge = False
+                
         if shirt_position := order.get("remote shirt"):
             has_size = False
             for answer in shirt_position.answers:
@@ -92,40 +142,30 @@ def main():
                     order_data["shirt_size"] = size
             if not has_size:
                 print(f"order {order_code} position {position.id} is missing a shirt size!")
-        if order_data.get("has_remote_badge") or order_data.get("has_remote_shirt"):
-            order_data["shipping_street"] = shipping_rows[order_code]["Invoice Address"]
-            order_data["shipping_city"] = shipping_rows[order_code]["Invoice City"]
-            order_data["shipping_state"] = shipping_rows[order_code]["Invoice State"]
-            order_data["shipping_zip"] = shipping_rows[order_code]["Invoice ZIP code"]
-            order_data["shipping_country"] = shipping_rows[order_code]["Invoice Country"]
-
         order_data["has_remote_speaker_gift"] = (order.get("speaker") is not None)
         printable_orders.append(order_data)
 
+        for order_data in printable_orders:
+            order_code = order_data["order_code"]
+            if order_data["has_remote_badge"] or order_data["has_remote_shirt"]:
+                if order_code in shipping_rows:
+                    order_data["shipping_street"] = shipping_rows[order_code]["Invoice Address"]
+                    order_data["shipping_city"] = shipping_rows[order_code]["Invoice City"]
+                    order_data["shipping_state"] = shipping_rows[order_code]["Invoice State"]
+                    order_data["shipping_zip"] = shipping_rows[order_code]["Invoice ZIP code"]
+                    order_data["shipping_country"] = shipping_rows[order_code]["Invoice Country"]
+                elif order_code in invoice_rows:
+                    order_data["shipping_street"] = invoice_rows[order_code]["Address"]
+                    order_data["shipping_city"] = invoice_rows[order_code]["City"]
+                    order_data["shipping_state"] = invoice_rows[order_code]["State"]
+                    order_data["shipping_zip"] = invoice_rows[order_code]["ZIP code"]
+                    order_data["shipping_country"] = invoice_rows[order_code]["Country"]
     with open(badge_out_file, "w") as f:
-        fieldnames = ["order_code","has_badge", "name", "affiliation", "extra_line", "pronouns", "shirt_size", "has_remote_speaker_gift", "has_remote_badge", "has_remote_shirt", "shipping_street", "shipping_city", "shipping_state", "shipping_zip", "shipping_country", "timestamp"]
+        fieldnames = ["order_code","has_badge", "name", "affiliation", "extra_line", "pronouns", "shirt_size", "has_remote_speaker_gift", "has_remote_badge", "has_remote_shirt", "shipping_street", "shipping_city", "shipping_state", "shipping_zip", "shipping_country", "timestamp", "has_multiple_lines"]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(printable_orders)
-
-            
     
-    #badges = []
-    #for order_code, position in positions_with_badges.items():
-    #    badge = badge_fields_for_position(position)
-    #    badge["order_code"] = order_code
-    #    badges.append(badge)
-    
-    #for order_code, position in positions_with_shirts.items():
-    #    has_size = False
-    #    for answer in position.answers:
-    #        if answer.question.id == tshirt_question_id:
-    #            has_size = True
-    #            size = answer.answer
-    #            order_sizes[order_code] = size
-    #            size_counts[size] = size_counts.get(size, 0) + 1
-    #    if not has_size:
-    #        print(f"order {order_code} position {position.id} is missing a shirt size!")
     with open(shirt_count_file, "w") as f:
         fieldnames = ["size", "count"]
         writer = csv.writer(f)
